@@ -1,0 +1,11 @@
+cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DTVM_TIRX_USE_LLVM="llvm-config --ignore-libllvm --link-static" \
+    -DTVM_HIDE_PRIVATE_SYMBOLS=ON \
+    -DTVM_TIRX_USE_CUDA=OFF \
+    -DTVM_TIRX_USE_METAL=OFF \
+    -DTVM_TIRX_USE_VULKAN=OFF \
+    -DTVM_TIRX_USE_OPENCL=OFF \
+    -DTVM_USE_CUBLAS=OFF \
+    -DTVM_USE_CUDNN=OFF \
+    -DTVM_USE_CUTLASS=OFF

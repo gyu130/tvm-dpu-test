@@ -1,0 +1,284 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+#include <gtest/gtest.h>
+#include <tvm/ffi/any.h>
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/memory.h>
+#include <tvm/ffi/optional.h>
+
+#include <cstdint>
+#include <cstring>
+
+#include "./testing_object.h"
+
+namespace {
+
+using namespace tvm::ffi;
+using namespace tvm::ffi::testing;
+
+// Regression guard: TypeTraits<Optional<T>>::storage_enabled must PROPAGATE from
+// TypeTraits<T>::storage_enabled (pass-through), not be hardcoded. This keeps a
+// nested Optional<Optional<T>> and Optional<T> used inside Variant<...>/containers
+// Any-backed exactly when T itself is storage-enabled.
+static_assert(TypeTraits<Optional<int>>::storage_enabled == TypeTraits<int>::storage_enabled);
+static_assert(TypeTraits<Optional<int>>::storage_enabled, "int is storage-enabled");
+static_assert(TypeTraits<Optional<TInt>>::storage_enabled == TypeTraits<TInt>::storage_enabled);
+static_assert(TypeTraits<Optional<TInt>>::storage_enabled, "ObjectRef is storage-enabled");
+// A non-owning view type is NOT storage-enabled; the pass-through must carry that.
+static_assert(!TypeTraits<TensorView>::storage_enabled);
+static_assert(TypeTraits<Optional<TensorView>>::storage_enabled ==
+              TypeTraits<TensorView>::storage_enabled);
+static_assert(!TypeTraits<Optional<TensorView>>::storage_enabled,
+              "Optional<view> must not be storage-enabled");
+// ObjectRef optionals are pointer-backed, while an outer Optional<Optional<T>>
+// remains Any-backed because nested optionals are intentionally distinct.
+static_assert(sizeof(Optional<TInt>) == sizeof(ObjectPtr<Object>));
+static_assert(alignof(Optional<TInt>) == alignof(ObjectPtr<Object>));
+static_assert(sizeof(Optional<Function>) == sizeof(Function));
+static_assert(alignof(Optional<Function>) == alignof(Function));
+static_assert(sizeof(Optional<Optional<int>>) == sizeof(Any));
+static_assert(sizeof(Optional<Optional<TInt>>) == sizeof(Any));
+static_assert(details::storage_enabled_v<Optional<int>>);
+
+TEST(Optional, StorageEnabledPassThrough) {
+  // Optional<int> is storage-enabled, so a nested Optional round-trips through
+  // Any via the Any-backed path.
+  Optional<Optional<int>> nested = Optional<int>(7);
+  Any any = nested;
+  auto back = any.cast<Optional<Optional<int>>>();
+  EXPECT_TRUE(back.has_value());
+  EXPECT_EQ(back.value().value(), 7);
+}
+
+TEST(Optional, TInt) {
+  Optional<TInt> x;
+  Optional<TInt> y = TInt(11);
+  static_assert(sizeof(Optional<TInt>) == sizeof(ObjectPtr<Object>));
+
+  EXPECT_TRUE(!x.has_value());
+  EXPECT_EQ(x.value_or(TInt(12))->value, 12);
+
+  EXPECT_TRUE(y.has_value());
+  EXPECT_EQ(y.value_or(TInt(12))->value, 11);
+
+  Any z_any = std::move(y);
+  EXPECT_TRUE(z_any != nullptr);
+  EXPECT_EQ((z_any.cast<TInt>())->value, 11);
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_TRUE(!y.has_value());
+
+  // move from any to optional
+  auto y2 = std::move(z_any).cast<Optional<TInt>>();
+  EXPECT_TRUE(y2.has_value());
+  EXPECT_EQ(y2.value_or(TInt(12))->value, 11);
+}
+
+TEST(Optional, ObjectRefPointerABI) {
+  static_assert(sizeof(Optional<ObjectRef>) == sizeof(ObjectPtr<Object>));
+  static_assert(alignof(Optional<ObjectRef>) == alignof(ObjectPtr<Object>));
+
+  ObjectRef value = TInt(19);
+  Optional<ObjectRef> present = value;
+  ASSERT_TRUE(present.has_value());
+  EXPECT_TRUE(present.same_as(value));
+  EXPECT_EQ(present.use_count(), value.use_count());
+
+  Any encoded = present;
+  Optional<ObjectRef> decoded = encoded.cast<Optional<ObjectRef>>();
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_TRUE(decoded.same_as(value));
+
+  Optional<ObjectRef> absent = std::nullopt;
+  EXPECT_EQ(absent.get(), nullptr);
+  EXPECT_FALSE(Any(absent).cast<Optional<ObjectRef>>().has_value());
+}
+
+TEST(Optional, double) {
+  Optional<double> x;
+  Optional<double> y = 11.0;
+  // Layout is independent of the contained type: sizeof(Optional<T>) == sizeof(Any).
+  static_assert(sizeof(Optional<double>) == sizeof(Any));
+
+  EXPECT_TRUE(!x.has_value());
+  EXPECT_EQ(x.value_or(12), 12);
+  EXPECT_TRUE(x != 12);
+
+  EXPECT_TRUE(y.has_value());
+  EXPECT_EQ(y.value_or(12), 11);
+  EXPECT_TRUE(y == 11);
+  EXPECT_TRUE(y != 12);
+}
+
+TEST(Optional, AnyConvertInt) {
+  Optional<int> opt_v0 = 1;
+  EXPECT_EQ(opt_v0.value(), 1);
+  EXPECT_TRUE(opt_v0.has_value());
+
+  AnyView view0 = opt_v0;
+  EXPECT_EQ(view0.cast<int>(), 1);
+
+  Any any1;
+  auto opt_v1 = std::move(any1).cast<Optional<int>>();
+  EXPECT_TRUE(!opt_v1.has_value());
+  Optional<int> opt_v2 = 11;
+  Any any2 = std::move(opt_v2);
+  EXPECT_EQ(any2.cast<int>(), 11);
+}
+
+TEST(Optional, AnyConvertArray) {
+  AnyView view0;
+  Array<Array<TNumber>> arr_nested = {{}, {TInt(1), TFloat(2)}};
+  view0 = arr_nested;
+
+  auto opt_arr = view0.cast<Optional<Array<Array<TNumber>>>>();
+  EXPECT_EQ(arr_nested.use_count(), 2);
+
+  auto arr1 = view0.cast<Optional<Array<Array<TNumber>>>>();
+  EXPECT_EQ(arr_nested.use_count(), 3);
+  EXPECT_EQ(arr1.value()[1][1].as<TFloatObj>()->value, 2);
+
+  Any any1;
+  auto arr2 = any1.cast<Optional<Array<Array<TNumber>>>>();
+  EXPECT_TRUE(!arr2.has_value());
+
+  EXPECT_THROW(
+      {
+        try {
+          [[maybe_unused]] auto arr2 = view0.cast<Optional<Array<Array<int>>>>();
+        } catch (const Error& error) {
+          EXPECT_EQ(error.kind(), "TypeError");
+          std::string what = error.what();
+          std::cout << what << std::endl;
+          EXPECT_NE(what.find("to `Optional<Array<Array<int>>>`"), std::string::npos);
+          throw;
+        }
+      },
+      ::tvm::ffi::Error);
+}
+
+TEST(Optional, OptionalOfOptional) {
+  // testcase of optional<optional>
+  //
+  // Because nullopt is uniformly represented as kTVMFFINone in the single
+  // TVMFFIAny backing, an engaged outer Optional that holds an empty inner
+  // Optional collapses to nullopt (the two states share the kTVMFFINone bit
+  // pattern). This matches the behavior of round-tripping a nested Optional
+  // through Any. Engaged-outer/engaged-inner still nests correctly.
+  Optional<Optional<int>> opt_opt_int;
+  EXPECT_TRUE(!opt_opt_int.has_value());
+
+  // engaged outer holding an empty inner collapses to nullopt.
+  Optional<Optional<int>> opt_opt_int2 = Optional<int>(std::nullopt);
+  EXPECT_TRUE(!opt_opt_int2.has_value());
+
+  // engaged outer holding an engaged inner nests correctly.
+  Optional<Optional<int>> opt_opt_int3 = Optional<int>(7);
+  EXPECT_TRUE(opt_opt_int3.has_value());
+  EXPECT_TRUE(opt_opt_int3.value().has_value());
+  EXPECT_EQ(opt_opt_int3.value().value(), 7);
+
+  // Optional<Optional<ObjectRef>>
+  Optional<Optional<TInt>> opt_opt_tint;
+  EXPECT_TRUE(!opt_opt_tint.has_value());
+
+  Optional<Optional<TInt>> opt_opt_tint2 = Optional<TInt>(std::nullopt);
+  EXPECT_TRUE(!opt_opt_tint2.has_value());
+  opt_opt_tint2 = std::nullopt;
+  EXPECT_TRUE(!opt_opt_tint2.has_value());
+
+  Optional<Optional<TInt>> opt_opt_tint3 = Optional<TInt>(TInt(42));
+  EXPECT_TRUE(opt_opt_tint3.has_value());
+  EXPECT_TRUE(opt_opt_tint3.value().has_value());
+  EXPECT_EQ(opt_opt_tint3.value().value()->value, 42);
+}
+
+TEST(Optional, ValueMove) {
+  Optional<TInt> y = TInt(11);
+  TInt x = std::move(y).value();
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_TRUE(!y.has_value());
+  EXPECT_EQ(x->value, 11);
+
+  Optional<TInt> opt_tint = TInt(21);
+  EXPECT_TRUE(opt_tint.has_value());
+  EXPECT_EQ((*opt_tint)->value, 21);
+
+  TInt moved_tint = *std::move(opt_tint);
+  EXPECT_EQ(moved_tint->value, 21);
+  // NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+  EXPECT_TRUE(!opt_tint.has_value());
+}
+
+TEST(Optional, OptionalInArray) {
+  // This pattern plus iteration may cause memory leak
+  // this is because arr[0] returns a temporary object
+  // and further call arr[0].value() may return a reference to
+  // the temporary object
+  Array<Optional<Array<TInt>>> arr = {Array<TInt>({TInt(0), TInt(1)})};
+  int counter = 0;
+
+  for (const auto& x : arr[0].value()) {
+    EXPECT_EQ(x->value, counter++);
+  }
+
+  Any any = arr;
+  auto opt_arr = any.cast<Array<Optional<Array<TInt>>>>();
+  EXPECT_EQ(opt_arr[0].value()[0]->value, 0);
+}
+
+TEST(Optional, String) {
+  Optional<String> opt_str;
+  EXPECT_TRUE(!opt_str.has_value());
+  EXPECT_EQ(opt_str.value_or("default"), "default");
+  EXPECT_TRUE(opt_str != "default");
+  EXPECT_TRUE(opt_str != String("default"));
+  EXPECT_TRUE(opt_str == std::nullopt);
+
+  opt_str = "hello";
+  EXPECT_TRUE(opt_str.has_value());
+  EXPECT_EQ(opt_str.value(), "hello");
+  EXPECT_TRUE(opt_str == "hello");
+  EXPECT_TRUE(opt_str == String("hello"));
+  EXPECT_TRUE(opt_str != std::nullopt);
+  static_assert(sizeof(Optional<String>) == sizeof(Any));
+}
+
+TEST(Optional, Bytes) {
+  Optional<Bytes> opt_bytes;
+  EXPECT_TRUE(!opt_bytes.has_value());
+  EXPECT_EQ(opt_bytes.value_or(std::string("default")), "default");
+
+  opt_bytes = std::string("hello");
+  EXPECT_TRUE(opt_bytes.has_value());
+  EXPECT_EQ(opt_bytes.value().operator std::string(), "hello");
+  EXPECT_TRUE(opt_bytes != std::nullopt);
+  static_assert(sizeof(Optional<Bytes>) == sizeof(Any));
+}
+
+// Non-object values keep the uniform TVMFFIAny representation. Object pointer
+// values are covered above by pointer-size ABI assertions.
+template <typename... T>
+constexpr bool all_non_object_optional_layouts_uniform_v =
+    ((sizeof(Optional<T>) == sizeof(TVMFFIAny) && alignof(Optional<T>) == alignof(TVMFFIAny)) &&
+     ...);
+static_assert(all_non_object_optional_layouts_uniform_v<bool, int8_t, int16_t, int32_t, int64_t,
+                                                        uint8_t, uint16_t, uint32_t, uint64_t,
+                                                        float, double, String, Bytes>);
+}  // namespace

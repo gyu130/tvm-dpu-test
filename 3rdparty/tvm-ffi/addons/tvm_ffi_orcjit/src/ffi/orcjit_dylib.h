@@ -1,0 +1,163 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*!
+ * \file orcjit_dylib.h
+ * \brief LLVM ORC JIT DynamicLibrary (JITDylib) wrapper
+ */
+#ifndef TVM_FFI_ORCJIT_ORCJIT_DYLIB_H_
+#define TVM_FFI_ORCJIT_ORCJIT_DYLIB_H_
+
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <tvm/ffi/container/array.h>
+#include <tvm/ffi/extra/module.h>
+#include <tvm/ffi/object.h>
+#include <tvm/ffi/string.h>
+
+#include <memory>
+
+#include "llvm_patches/macho_cxa_atexit_shim.h"
+#include "orcjit_session.h"
+
+namespace tvm {
+namespace ffi {
+namespace orcjit {
+
+class ORCJITExecutionSession;
+
+class ORCJITDynamicLibraryObj : public ModuleObj {
+ public:
+  // The session is this dylib's factory and lifetime owner (create / teardown);
+  // it also drives the high-level load path (ORCJITExecutionSessionObj::LoadModule)
+  // through the private add and finalize helpers below.
+  friend class ORCJITExecutionSessionObj;
+
+  /*!
+   * \brief Constructor
+   * \param session The parent execution session
+   * \param dylib The LLVM JITDylib
+   * \param jit The LLJIT instance
+   * \param name The library name
+   */
+  ORCJITDynamicLibraryObj(ORCJITExecutionSession session, llvm::orc::JITDylib* dylib,
+                          llvm::orc::LLJIT* jit, String name);
+
+  ~ORCJITDynamicLibraryObj();
+
+  const char* kind() const final { return "orcjit"; }
+
+  Optional<Function> GetFunction(const String& name) override;
+
+ private:
+  /*!
+   * \brief Add an object file to this library
+   * \param path Path to the object file to load
+   */
+  void AddObjectFile(const String& path);
+
+  /*!
+   * \brief Add an in-memory object-file image to this library.
+   * \param bytes The object-file bytes. Copied into an owned MemoryBuffer, so
+   *        the caller's bytes need not outlive linking.
+   */
+  void AddObjectBytes(const Bytes& bytes);
+
+  /*!
+   * \brief Add an object-file MemoryBuffer to this library (shared back end).
+   * \param buffer The object-file image. LLVM takes ownership.
+   */
+  void AddObjectBuffer(std::unique_ptr<llvm::MemoryBuffer> buffer);
+
+  /*!
+   * \brief Finalize the high-level load: inject context symbols and, if the
+   *        objects embed a library binary, reconstruct the import tree.
+   *
+   * Must run exactly once per dylib (guarded by \c finalized_); a second call
+   * would append duplicate imports, since \c ModuleObj::ImportModule does not
+   * deduplicate. Only \c LoadModule calls this.
+   *
+   * \return The root module (this dylib when there is no embedded binary).
+   */
+  Module Finalize();
+
+  /*! \brief Inject library-context symbols; runs once per dylib (see Finalize). */
+  void InitContextSymbols();
+
+  /*!
+   * \brief Look up a symbol in this library
+   * \param name The symbol name to look up
+   * \return Pointer to the symbol, or nullptr if not found
+   */
+  void* GetSymbol(const String& name);
+
+  /*!
+   * \brief Get the underlying LLVM JITDylib
+   * \return Reference to the LLVM JITDylib
+   */
+  llvm::orc::JITDylib& GetJITDylib();
+
+  /*! \brief Parent execution session (for lifetime management) */
+  ORCJITExecutionSession session_;
+
+  /*! \brief The LLVM JITDylib */
+  llvm::orc::JITDylib* dylib_;
+
+  /*! \brief The LLJIT instance (for addObjectFile API) */
+  llvm::orc::LLJIT* jit_;
+
+  /*! \brief Library name */
+  String name_;
+
+  /*! \brief Whether Finalize has run; guards against double-finalizing. */
+  bool finalized_{false};
+
+#ifdef __APPLE__
+  /*! \brief Per-dylib __cxa_atexit registry.
+   *
+   *  Without MachOPlatform, clang-lowered \c __attribute__((destructor))
+   *  and C++ global dtors register through \c __cxa_atexit during init.
+   *  We interpose \c ___cxa_atexit per-JITDylib (see
+   *  \c orcjit_session.cc); the shim pushes \c (fn, arg) into the vector
+   *  published via \c CxaAtexitRecordsScope around each JIT entry.  The
+   *  destructor drains LIFO before \c RemoveDylib. */
+  CxaAtexitRecords cxa_atexit_records_;
+#endif  // __APPLE__
+};
+
+/*!
+ * \brief DynamicLibrary wrapper for LLVM ORC JIT v2 JITDylib
+ *
+ * This class wraps an LLVM JITDylib and provides functionality to:
+ * - Load object files
+ * - Link against other dynamic libraries
+ * - Look up symbols
+ */
+class ORCJITDynamicLibrary : public Module {
+ public:
+  explicit ORCJITDynamicLibrary(const ObjectPtr<ORCJITDynamicLibraryObj>& ptr) : Module(ptr) {};
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(ORCJITDynamicLibrary, Module,
+                                                ORCJITDynamicLibraryObj);
+};
+
+}  // namespace orcjit
+}  // namespace ffi
+}  // namespace tvm
+
+#endif  // TVM_FFI_ORCJIT_ORCJIT_DYLIB_H_

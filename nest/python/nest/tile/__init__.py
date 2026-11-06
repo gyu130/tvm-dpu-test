@@ -36,6 +36,16 @@ from .encoder import (
     encode_arith, encode_items, disassemble,
 )
 from .memory import Allocation, MemoryPlan, plan_memory
+from .autoschedule import (
+    AutoScheduleOptions,
+    AutoScheduleResult,
+    CostEstimate,
+    CostModel,
+    StageEstimate,
+    Trial,
+    auto_schedule,
+    estimate_module,
+)
 from .multicore import (
     CoreBarrier,
     CoreLoad,
@@ -69,6 +79,9 @@ __all__ = [
     # 其他
     "Allocation", "MemoryPlan", "plan_memory",
     "print_program", "ScheduleOptions", "schedule_module", "validate_program",
+    # AutoSchedule
+    "AutoScheduleOptions", "AutoScheduleResult", "CostEstimate", "CostModel",
+    "StageEstimate", "Trial", "auto_schedule", "estimate_module",
     "MultiCoreOptions", "MultiCoreProgram", "SplitPlan", "HaloSpec",
     "CoreBarrier", "CoreSyncGraph", "CoreLoad", "schedule_multicore",
     "DoubleBufferEntry", "DoubleBufferPlan", "plan_double_buffer",

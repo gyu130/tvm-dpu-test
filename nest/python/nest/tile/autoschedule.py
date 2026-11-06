@@ -361,7 +361,8 @@ def _build_axes(
             continue
         if node.canonical_name in _CONV_OPS:
             group = int(node.attrs.get("group", 1)) or 1
-            conv_dims.append(types[node.inputs[0]].shape[1] // group)
+            # conv tile 作用在权重输出通道维（OIHW 的 O），与 schedule 模板一致。
+            conv_dims.append(types[node.inputs[1]].shape[0] // group)
         elif node.canonical_name in _GEMM_OPS:
             b_type = types[node.inputs[1]]
             trans_b = int(node.attrs.get("transB", 0))

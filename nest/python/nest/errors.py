@@ -69,6 +69,10 @@ class ScheduleError(NestError):
     """调度模板无法生成合法的 tile 程序。"""
 
 
+class TuneError(NestError):
+    """AutoTune / Ansor 的配置空间、日志或调优流程使用错误。"""
+
+
 class TileValidationError(NestError):
     """NestTile 不变式校验失败。"""
 

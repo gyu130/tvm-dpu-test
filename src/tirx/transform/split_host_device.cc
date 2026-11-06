@@ -74,10 +74,18 @@ PrimFunc AnnotateDeviceRegionsForSplit(PrimFunc func) {
   Target target = opt_target.value();
 
   if (target->GetHost()) {
-    DeviceRegionAnnotater mutator(target.WithoutHost());
-    auto body = mutator(func->body);
-    if (!body.same_as(func->body)) {
-      func.CopyOnWrite()->body = body;
+    if (target->kind->name == "dpu") {
+      // DPU kernels do not express their launch shape with thread extents,
+      // so the entire function body is device code.  Annotate the whole
+      // body as a device region to have it extracted into the DPU module.
+      func.CopyOnWrite()->body =
+          AttrStmt(target.WithoutHost(), tvm::attr::kTarget, 0, func->body);
+    } else {
+      DeviceRegionAnnotater mutator(target.WithoutHost());
+      auto body = mutator(func->body);
+      if (!body.same_as(func->body)) {
+        func.CopyOnWrite()->body = body;
+      }
     }
   }
   return func;

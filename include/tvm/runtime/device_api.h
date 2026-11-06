@@ -348,6 +348,8 @@ inline const char* DLDeviceType2Str(int type) {
       return "hexagon";
     case kDLTrn:
       return "trn";
+    case kDLDPU:
+      return "dpu";
     default:
       TVM_FFI_THROW(InternalError) << "unknown type = " << type;
   }

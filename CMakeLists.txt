@@ -341,6 +341,7 @@ tvm_file_glob(GLOB CODEGEN_SRCS
   src/backend/cuda/codegen/*.cc
   src/backend/cuda/op/*.cc
   src/backend/cuda/transforms/*.cc
+  src/backend/dpu/codegen/*.cc
   src/backend/hexagon/codegen/*.cc
   src/backend/metal/codegen/*.cc
   src/backend/metal/op/*.cc

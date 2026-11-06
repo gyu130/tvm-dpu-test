@@ -30,6 +30,7 @@ from tvm.base import _LOADED_LIBS
 
 _BUILTIN_BACKENDS = (
     "cuda",
+    "dpu",
     "metal",
     "rocm",
     "trn",

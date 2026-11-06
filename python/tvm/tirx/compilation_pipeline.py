@@ -159,6 +159,8 @@ def get_default_tir_pipeline(
     target: tvm.target.Target,  # pylint: disable=unused-argument
 ) -> tvm.transform.Pass:
     """Get the default TIR pipeline for the given target."""
+    if target.kind.name == "dpu":
+        return get_tir_pipeline("dpu")
     if target.kind.name == "opencl" and "adreno" in target.keys:
         return get_tir_pipeline("adreno")
     else:

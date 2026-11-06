@@ -120,6 +120,7 @@ typedef enum {
   kDLMAIA = 17,
   /*! \brief AWS Trainium */
   kDLTrn = 18,
+  kDLDPU = 19,
 } DLDeviceType;
 
 /*!

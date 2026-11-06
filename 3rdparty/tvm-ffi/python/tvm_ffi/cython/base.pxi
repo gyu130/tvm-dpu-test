@@ -45,6 +45,7 @@ cdef extern from "dlpack/dlpack.h":
         kDLHexagon = 16,
         kDLMAIA = 17
         kDLTrn = 18
+        kDLDPU = 19
 
     ctypedef struct DLDataType:
         uint8_t code

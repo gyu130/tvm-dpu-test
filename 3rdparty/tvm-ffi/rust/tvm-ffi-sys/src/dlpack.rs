@@ -41,6 +41,7 @@ pub enum DLDeviceType {
     kDLHexagon = 16,
     kDLMAIA = 17,
     kDLTrn = 18,
+    kDLDPU = 19,
 }
 
 #[repr(C)]

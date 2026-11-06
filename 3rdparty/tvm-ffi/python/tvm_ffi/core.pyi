@@ -141,6 +141,7 @@ class DLDeviceType(IntEnum):
     kDLWebGPU = 15
     kDLHexagon = 16
     kDLTrn = 17
+    kDLDPU = 18
 
 class Device:
     def __init__(self, device_type: str | int, index: int | None = None) -> None: ...

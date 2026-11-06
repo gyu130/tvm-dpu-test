@@ -42,7 +42,7 @@ TEST(Device, AnyConversionWithString) {
       {"cpu", kDLCPU},        {"cuda", kDLCUDA},       {"opencl", kDLOpenCL}, {"vulkan", kDLVulkan},
       {"metal", kDLMetal},    {"mps", kDLMetal},       {"vpi", kDLVPI},       {"rocm", kDLROCM},
       {"ext_dev", kDLExtDev}, {"hexagon", kDLHexagon}, {"wgpu", kDLWebGPU},   {"webgpu", kDLWebGPU},
-      {"maia", kDLMAIA},      {"trn", kDLTrn},
+      {"maia", kDLMAIA},      {"trn", kDLTrn},       {"dpu", kDLDPU},
   };
   for (const TestCase& test_case : test_cases) {
     SCOPED_TRACE(test_case.name);

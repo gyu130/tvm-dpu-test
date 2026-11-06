@@ -594,6 +594,8 @@ const char* DeviceTypeName(int device_type) {
       return "maia";
     case kDLTrn:
       return "trn";
+    case kDLDPU:
+      return "dpu";
     default:
       return "unknown";
   }

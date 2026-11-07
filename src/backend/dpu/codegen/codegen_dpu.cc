@@ -53,10 +53,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <iomanip>
-#include <map>
-#include <optional>
-#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -65,6 +61,7 @@
 
 #include "../../../target/build_common.h"
 #include "../../../target/source/codegen_source_base.h"
+#include "dpu_ir.h"
 #include "dpu_isa.h"
 
 namespace tvm {
@@ -92,19 +89,6 @@ struct Value {
   uint32_t reg = 0;
   /*! \brief Whether the register is a temporary owned by the caller. */
   bool temp = false;
-};
-
-struct Inst {
-  uint32_t word = 0;
-  std::string text;
-};
-
-struct PendingBranch {
-  size_t inst;
-  int label;
-  uint32_t op;
-  uint32_t rs1;
-  uint32_t rs2;
 };
 
 struct PatternInfo {
@@ -250,47 +234,53 @@ class DpuCodeGen {
     VisitStmt(func_->body);
     PopScope();
     MarkLabel(end_label_);
-    Emit(EncodeEnd(), "END");
+    EmitEnd("END");
 
-    ResolveBranches();
-
-    for (size_t i = 0; i < insts_.size(); ++i) {
-      for (const auto& kv : label_pos_) {
-        if (kv.second == i) {
-          os << "L" << kv.first << ":\n";
-        }
-      }
-      os << "  0x" << std::hex << std::uppercase << std::setw(8) << std::setfill('0')
-         << insts_[i].word << std::dec << std::nouppercase << std::setfill(' ') << "  ; "
-         << insts_[i].text << "\n";
-    }
+    // The DPU IR (DpuInst list) is now complete.  Encode it to 32-bit words
+    // and render the assembly listing; branch offsets are resolved here.
+    os << program_.Format();
     return os.str();
   }
 
  private:
   // ------------------------------------------------------------------
   // Emission helpers
+  //
+  // Lowering emits DpuInst objects (the DPU IR).  The bit-level encoding
+  // into 32-bit words happens later in DpuProgram::Encode().
   // ------------------------------------------------------------------
-  void Emit(uint32_t word, std::string text) {
-    insts_.push_back(Inst{word, std::move(text)});
+  void EmitAluI(uint32_t op, uint32_t rd, uint32_t rs1, int32_t imm, std::string text) {
+    program_.Append(DpuInst::AluI(op, rd, rs1, imm, std::move(text)));
   }
+  void EmitAluR(uint32_t op, uint32_t rd, uint32_t rs1, uint32_t rs2, std::string text) {
+    program_.Append(DpuInst::AluR(op, rd, rs1, rs2, std::move(text)));
+  }
+  void EmitAluRB(uint32_t op, uint32_t rd, uint32_t rs1, uint32_t rs2, std::string text) {
+    program_.Append(DpuInst::AluRB(op, rd, rs1, rs2, std::move(text)));
+  }
+  void EmitMov(uint32_t rd, uint32_t rs, std::string text) {
+    program_.Append(DpuInst::Mov(rd, rs, std::move(text)));
+  }
+  void EmitMovi(uint32_t rd, int32_t imm, std::string text) {
+    program_.Append(DpuInst::Movi(rd, imm, std::move(text)));
+  }
+  void EmitLoad(uint32_t rd, uint32_t addr, uint32_t width, bool is_signed, std::string text) {
+    program_.Append(DpuInst::Load(rd, addr, width, is_signed, std::move(text)));
+  }
+  void EmitStore(uint32_t addr, uint32_t value, uint32_t width, std::string text) {
+    program_.Append(DpuInst::Store(addr, value, width, std::move(text)));
+  }
+  void EmitSync(uint32_t subop, std::string text) {
+    program_.Append(DpuInst::Sync(subop, std::move(text)));
+  }
+  void EmitEnd(std::string text) { program_.Append(DpuInst::End(std::move(text))); }
 
   int NewLabel() { return next_label_++; }
 
-  void MarkLabel(int label) { label_pos_[label] = insts_.size(); }
+  void MarkLabel(int label) { program_.MarkLabel(label); }
 
   void EmitBranch(uint32_t op, uint32_t rs1, uint32_t rs2, int label, const std::string& text) {
-    pending_branches_.push_back(PendingBranch{insts_.size(), label, op, rs1, rs2});
-    Emit(0u, text);
-  }
-
-  void ResolveBranches() {
-    for (const PendingBranch& branch : pending_branches_) {
-      auto it = label_pos_.find(branch.label);
-      TVM_FFI_ICHECK(it != label_pos_.end()) << "unresolved DPU branch label L" << branch.label;
-      int32_t offset = static_cast<int32_t>(it->second) - static_cast<int32_t>(branch.inst + 1);
-      insts_[branch.inst].word = EncodeCtrl(branch.op, branch.rs1, branch.rs2, offset);
-    }
+    program_.Append(DpuInst::Branch(op, rs1, rs2, label, text));
   }
 
   /*! \brief Materialize a 32-bit constant into \p rd. */
@@ -299,17 +289,17 @@ class DpuCodeGen {
                   value <= std::numeric_limits<int32_t>::max())
         << "DPU constant out of 32-bit range: " << value;
     if (value >= -(1 << 17) && value < (1 << 17)) {
-      Emit(EncodeMovi(rd, value), "MOVI " + RegName(rd) + ", " + std::to_string(value));
+      EmitMovi(rd, value, "MOVI " + RegName(rd) + ", " + std::to_string(value));
       return;
     }
     int64_t lo = value & 0xFFFF;
     int64_t hi = (value >> 16) & 0xFFFF;
-    Emit(EncodeMovi(rd, lo), "MOVI " + RegName(rd) + ", " + std::to_string(lo));
+    EmitMovi(rd, lo, "MOVI " + RegName(rd) + ", " + std::to_string(lo));
     if (hi != 0) {
       uint32_t tmp = AllocReg();
-      Emit(EncodeMovi(tmp, hi), "MOVI " + RegName(tmp) + ", " + std::to_string(hi));
-      Emit(EncodeAluI(kShl, tmp, tmp, 16), "SHL " + RegName(tmp) + ", " + RegName(tmp) + ", 16");
-      Emit(EncodeAluR(kOr, rd, rd, tmp),
+      EmitMovi(tmp, hi, "MOVI " + RegName(tmp) + ", " + std::to_string(hi));
+      EmitAluI(kShl, tmp, tmp, 16, "SHL " + RegName(tmp) + ", " + RegName(tmp) + ", 16");
+      EmitAluR(kOr, rd, rd, tmp,
            "OR " + RegName(rd) + ", " + RegName(rd) + ", " + RegName(tmp));
       FreeReg(tmp);
     }
@@ -450,8 +440,8 @@ class DpuCodeGen {
     if (auto not_node = e.as<tirx::NotNode>()) {
       Value value = EvalExpr(not_node->a);
       uint32_t dest = AllocReg();
-      Emit(EncodeAluI(kXor, dest, value.reg, 1),
-           "XOR " + RegName(dest) + ", " + RegName(value.reg) + ", 1");
+      EmitAluI(kXor, dest, value.reg, 1,
+               "XOR " + RegName(dest) + ", " + RegName(value.reg) + ", 1");
       ReleaseIfTemp(value);
       return Value{dest, true};
     }
@@ -487,18 +477,18 @@ class DpuCodeGen {
     if (IsIntImm(b, &imm) && FitsImm14(imm)) {
       Value lhs = EvalExpr(a);
       uint32_t dest = AllocReg();
-      Emit(EncodeAluI(op, dest, lhs.reg, imm),
-           std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", " +
-               std::to_string(imm));
+      EmitAluI(op, dest, lhs.reg, imm,
+               std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", " +
+                   std::to_string(imm));
       ReleaseIfTemp(lhs);
       return Value{dest, true};
     }
     if (IsIntImm(a, &imm) && FitsImm14(imm)) {
       Value rhs = EvalExpr(b);
       uint32_t dest = AllocReg();
-      Emit(EncodeAluI(op, dest, rhs.reg, imm),
-           std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(rhs.reg) + ", " +
-               std::to_string(imm));
+      EmitAluI(op, dest, rhs.reg, imm,
+               std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(rhs.reg) + ", " +
+                   std::to_string(imm));
       ReleaseIfTemp(rhs);
       return Value{dest, true};
     }
@@ -511,16 +501,16 @@ class DpuCodeGen {
     // The zero register can stand in for a constant zero operand.
     if (IsIntImm(b, &imm) && imm == 0) {
       uint32_t dest = AllocReg();
-      Emit(EncodeAluR(op, dest, lhs.reg, kZeroReg),
-           std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", r0");
+      EmitAluR(op, dest, lhs.reg, kZeroReg,
+               std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", r0");
       ReleaseIfTemp(lhs);
       return Value{dest, true};
     }
     Value rhs = EvalExpr(b);
     uint32_t dest = AllocReg();
-    Emit(EncodeAluR(op, dest, lhs.reg, rhs.reg),
-         std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", " +
-             RegName(rhs.reg));
+    EmitAluR(op, dest, lhs.reg, rhs.reg,
+             std::string(AluName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", " +
+                 RegName(rhs.reg));
     ReleaseIfTemp(lhs);
     ReleaseIfTemp(rhs);
     return Value{dest, true};
@@ -556,8 +546,8 @@ class DpuCodeGen {
       Value lhs = EvalExpr(a);
       Value rhs = EvalExpr(b);
       uint32_t dest = AllocReg();
-      Emit(EncodeAluR(kMul, dest, lhs.reg, rhs.reg),
-           "MUL " + RegName(dest) + ", " + RegName(lhs.reg) + ", " + RegName(rhs.reg));
+      EmitAluR(kMul, dest, lhs.reg, rhs.reg,
+               "MUL " + RegName(dest) + ", " + RegName(lhs.reg) + ", " + RegName(rhs.reg));
       ReleaseIfTemp(lhs);
       ReleaseIfTemp(rhs);
       return Value{dest, true};
@@ -574,8 +564,8 @@ class DpuCodeGen {
         ++shift;
       }
       dest = AllocReg();
-      Emit(EncodeAluI(kShl, dest, src.reg, shift),
-           "SHL " + RegName(dest) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
+      EmitAluI(kShl, dest, src.reg, shift,
+               "SHL " + RegName(dest) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
     } else if (constant > 1 && ((constant - 1) & (constant - 2)) == 0) {
       // constant == 2^k + 1
       int shift = 0;
@@ -583,11 +573,11 @@ class DpuCodeGen {
         ++shift;
       }
       uint32_t shifted = AllocReg();
-      Emit(EncodeAluI(kShl, shifted, src.reg, shift),
-           "SHL " + RegName(shifted) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
+      EmitAluI(kShl, shifted, src.reg, shift,
+               "SHL " + RegName(shifted) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
       dest = AllocReg();
-      Emit(EncodeAluR(kAdd, dest, shifted, src.reg),
-           "ADD " + RegName(dest) + ", " + RegName(shifted) + ", " + RegName(src.reg));
+      EmitAluR(kAdd, dest, shifted, src.reg,
+               "ADD " + RegName(dest) + ", " + RegName(shifted) + ", " + RegName(src.reg));
       FreeReg(shifted);
     } else if (constant > 1 && ((constant + 1) & constant) == 0) {
       // constant == 2^k - 1
@@ -596,17 +586,17 @@ class DpuCodeGen {
         ++shift;
       }
       uint32_t shifted = AllocReg();
-      Emit(EncodeAluI(kShl, shifted, src.reg, shift),
-           "SHL " + RegName(shifted) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
+      EmitAluI(kShl, shifted, src.reg, shift,
+               "SHL " + RegName(shifted) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
       dest = AllocReg();
-      Emit(EncodeAluR(kSub, dest, shifted, src.reg),
-           "SUB " + RegName(dest) + ", " + RegName(shifted) + ", " + RegName(src.reg));
+      EmitAluR(kSub, dest, shifted, src.reg,
+               "SUB " + RegName(dest) + ", " + RegName(shifted) + ", " + RegName(src.reg));
       FreeReg(shifted);
     } else {
       uint32_t cst = Materialize(constant);
       dest = AllocReg();
-      Emit(EncodeAluR(kMul, dest, src.reg, cst),
-           "MUL " + RegName(dest) + ", " + RegName(src.reg) + ", " + RegName(cst));
+      EmitAluR(kMul, dest, src.reg, cst,
+               "MUL " + RegName(dest) + ", " + RegName(src.reg) + ", " + RegName(cst));
       FreeReg(cst);
     }
     ReleaseIfTemp(src);
@@ -617,9 +607,9 @@ class DpuCodeGen {
     Value lhs = EvalExpr(a);
     Value rhs = EvalExpr(b);
     uint32_t dest = AllocReg();
-    Emit(EncodeAluRB(op, dest, lhs.reg, rhs.reg),
-         std::string(AluRbName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", " +
-             RegName(rhs.reg));
+    EmitAluRB(op, dest, lhs.reg, rhs.reg,
+              std::string(AluRbName(op)) + " " + RegName(dest) + ", " + RegName(lhs.reg) + ", " +
+                  RegName(rhs.reg));
     ReleaseIfTemp(lhs);
     ReleaseIfTemp(rhs);
     return Value{dest, true};
@@ -634,12 +624,12 @@ class DpuCodeGen {
     int end_label = NewLabel();
     EmitBranch(kBne, cond.reg, kZeroReg, true_label,
                "BNE " + RegName(cond.reg) + ", r0, L" + std::to_string(true_label));
-    Emit(EncodeMov(dest, false_value.reg),
-         "MOV " + RegName(dest) + ", " + RegName(false_value.reg));
+    EmitMov(dest, false_value.reg,
+            "MOV " + RegName(dest) + ", " + RegName(false_value.reg));
     EmitBranch(kBranch, kZeroReg, kZeroReg, end_label, "B L" + std::to_string(end_label));
     MarkLabel(true_label);
-    Emit(EncodeMov(dest, true_value.reg),
-         "MOV " + RegName(dest) + ", " + RegName(true_value.reg));
+    EmitMov(dest, true_value.reg,
+            "MOV " + RegName(dest) + ", " + RegName(true_value.reg));
     MarkLabel(end_label);
     ReleaseIfTemp(cond);
     ReleaseIfTemp(true_value);
@@ -673,8 +663,8 @@ class DpuCodeGen {
       Value value = EvalExpr(call->args[0]);
       uint32_t dest = AllocReg();
       uint32_t mask = Materialize(0xFFFFFFFF);
-      Emit(EncodeAluR(kXor, dest, value.reg, mask),
-           "XOR " + RegName(dest) + ", " + RegName(value.reg) + ", " + RegName(mask));
+      EmitAluR(kXor, dest, value.reg, mask,
+               "XOR " + RegName(dest) + ", " + RegName(value.reg) + ", " + RegName(mask));
       FreeReg(mask);
       ReleaseIfTemp(value);
       return Value{dest, true};
@@ -697,12 +687,12 @@ class DpuCodeGen {
     if (dst_bits == 32 && src_bits < 32) {
       int shift = 32 - src_bits;
       uint32_t dest = AllocReg();
-      Emit(EncodeAluI(kShl, dest, src.reg, shift),
-           "SHL " + RegName(dest) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
+      EmitAluI(kShl, dest, src.reg, shift,
+               "SHL " + RegName(dest) + ", " + RegName(src.reg) + ", " + std::to_string(shift));
       bool is_signed = src_ty.code() == kDLInt;
-      Emit(EncodeAluI(is_signed ? kSar : kShr, dest, dest, shift),
-           std::string(AluName(is_signed ? kSar : kShr)) + " " + RegName(dest) + ", " +
-               RegName(dest) + ", " + std::to_string(shift));
+      EmitAluI(is_signed ? kSar : kShr, dest, dest, shift,
+               std::string(AluName(is_signed ? kSar : kShr)) + " " + RegName(dest) + ", " +
+                   RegName(dest) + ", " + std::to_string(shift));
       ReleaseIfTemp(src);
       return Value{dest, true};
     }
@@ -780,8 +770,8 @@ class DpuCodeGen {
     }
 
     uint32_t addr = AllocReg();
-    Emit(EncodeAluR(kAdd, addr, base, offset.reg),
-         "ADD " + RegName(addr) + ", " + RegName(base) + ", " + RegName(offset.reg));
+    EmitAluR(kAdd, addr, base, offset.reg,
+             "ADD " + RegName(addr) + ", " + RegName(base) + ", " + RegName(offset.reg));
     if (base_temp) {
       FreeReg(base);
     }
@@ -794,9 +784,9 @@ class DpuCodeGen {
     int bytes = ElemBytes(load->buffer);
     bool is_signed = load->buffer->dtype.code() == kDLInt;
     uint32_t dest = AllocReg();
-    Emit(EncodeLoad(dest, addr, WidthCode(bytes), is_signed),
-         "LOADM " + RegName(dest) + ", [" + RegName(addr) + "], " + std::to_string(bytes) + "B" +
-             (is_signed ? " signed" : " unsigned"));
+    EmitLoad(dest, addr, WidthCode(bytes), is_signed,
+             "LOADM " + RegName(dest) + ", [" + RegName(addr) + "], " + std::to_string(bytes) + "B" +
+                 (is_signed ? " signed" : " unsigned"));
     FreeReg(addr);
     return Value{dest, true};
   }
@@ -805,9 +795,9 @@ class DpuCodeGen {
     uint32_t addr = EvalAddress(store->buffer, store->indices);
     Value value = EvalExpr(store->value);
     int bytes = ElemBytes(store->buffer);
-    Emit(EncodeStore(addr, value.reg, WidthCode(bytes)),
-         "STOREM [" + RegName(addr) + "], " + RegName(value.reg) + ", " + std::to_string(bytes) +
-             "B");
+    EmitStore(addr, value.reg, WidthCode(bytes),
+              "STOREM [" + RegName(addr) + "], " + RegName(value.reg) + ", " + std::to_string(bytes) +
+                  "B");
     FreeReg(addr);
     ReleaseIfTemp(value);
   }
@@ -829,7 +819,7 @@ class DpuCodeGen {
       } else {
         Value value = EvalExpr(bind->value);
         reg = AllocReg();
-        Emit(EncodeMov(reg, value.reg), "MOV " + RegName(reg) + ", " + RegName(value.reg));
+        EmitMov(reg, value.reg, "MOV " + RegName(reg) + ", " + RegName(value.reg));
         ReleaseIfTemp(value);
       }
       BindVar(bind->var, reg, true);
@@ -916,8 +906,8 @@ class DpuCodeGen {
       EmitConst(counter, 0);
     } else {
       Value min_value = EvalExpr(for_node->min);
-      Emit(EncodeMov(counter, min_value.reg),
-           "MOV " + RegName(counter) + ", " + RegName(min_value.reg));
+      EmitMov(counter, min_value.reg,
+              "MOV " + RegName(counter) + ", " + RegName(min_value.reg));
       ReleaseIfTemp(min_value);
     }
     // limit = min + extent
@@ -938,8 +928,8 @@ class DpuCodeGen {
     PopScope();
 
     MarkLabel(continue_label);
-    Emit(EncodeAluI(kAdd, counter, counter, 1),
-         "ADD " + RegName(counter) + ", " + RegName(counter) + ", 1");
+    EmitAluI(kAdd, counter, counter, 1,
+             "ADD " + RegName(counter) + ", " + RegName(counter) + ", 1");
     EmitBranch(kBlt, counter, limit, loop_label,
                "BLT " + RegName(counter) + ", " + RegName(limit) + ", L" +
                    std::to_string(loop_label));
@@ -995,7 +985,7 @@ class DpuCodeGen {
   int64_t alignment_;
   int64_t next_sram_offset_ = 0;
 
-  std::vector<Inst> insts_;
+  DpuProgram program_;
   std::vector<bool> reg_used_ = std::vector<bool>(32, false);
   std::vector<std::unordered_map<const tvm::VarNode*, Binding>> scopes_;
   std::unordered_map<const tvm::VarNode*, uint32_t> param_regs_;
@@ -1003,8 +993,6 @@ class DpuCodeGen {
   std::unordered_map<const tvm::VarNode*, int64_t> alloc_offsets_;
   std::vector<LoopLabels> loop_stack_;
 
-  std::map<int, size_t> label_pos_;
-  std::vector<PendingBranch> pending_branches_;
   int next_label_ = 0;
   int end_label_ = -1;
   PatternInfo pattern_;
